@@ -34,6 +34,7 @@ sys.path.insert(0, HERE)
 from games import GAME, GAMES, DATA_DIR, require, source_frames, half_video_blocks  # noqa: E402
 from baseline import (team_of_each_track, write_submission, RESULTS_DIR,  # noqa: E402
                       FIELD_SEP, GROUP_SEP, MISSING)
+from load_smart_tagging import load as load_tagging  # noqa: E402
 
 # ---- Parameters: fixed a priori, NOT tuned on ground truth ----------------------------------
 FPS = 25
@@ -45,6 +46,12 @@ STILL_WINDOW = 25    # frames: +/- 1 s window to measure ball motion
 STILL_M = 1.0        # m: ball moved less than this over the window -> motionless
 EV_OOB = 2.5         # nats for D when the ball is outside the pitch
 EV_STILL = 2.0       # nats for D when the ball is motionless
+# Smart Tagging "SET PIECES" windows end a dead-ball stretch (a restart). The window is ~5 s and the
+# restart instant sits about 2/3 of the way through it: the published kickoff anchors fall at
+# 0.70 and 0.66 of the two kickoff windows (see load_smart_tagging.check_time_base). Fixed from
+# those anchors, not from possession ground truth.
+SP_FRACTION = 0.68
+EV_SETPIECE = 1.5    # nats for D before the restart instant, inside a SET PIECES window
 MEAN_POSSESSION_S = 15.0
 MEAN_DEAD_S = 10.0
 MIN_RUN = 2 * FPS    # frames: shortest run kept (2 s)
@@ -102,7 +109,7 @@ def extract_features(raw_path, team_of_track, n_frames, pitch):
     return bx, by, d_home, d_away
 
 
-def emissions(bx, by, d_home, d_away, pitch):
+def emissions(bx, by, d_home, d_away, pitch, set_piece_dead=None):
     """(n, 3) log-evidence for H, A, D. Only differences between states matter."""
     length, width = pitch
     n = len(bx)
@@ -128,7 +135,21 @@ def emissions(bx, by, d_home, d_away, pitch):
     e[live, A] += BONUS
     e[outside, D] += EV_OOB
     e[still & ~outside, D] += EV_STILL
+    if set_piece_dead is not None:
+        e[set_piece_dead, D] += EV_SETPIECE
     return e
+
+
+def set_piece_mask(n_frames):
+    """True on frames inside a SET PIECES window, before the restart instant. From Smart Tagging."""
+    mask = np.zeros(n_frames, dtype=bool)
+    for event in load_tagging():
+        if (event["code"] or "").strip().lower() != "set pieces":
+            continue
+        first = max(0, event["start_frame"])
+        restart = first + int(round(SP_FRACTION * (event["end_frame"] - event["start_frame"])))
+        mask[first:min(restart, n_frames)] = True
+    return mask
 
 
 def log_transitions():
@@ -202,6 +223,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--name", default="improved_hmm")
     parser.add_argument("--out", default=RESULTS_DIR)
+    parser.add_argument("--no-tagging", action="store_true",
+                        help="do not use Smart Tagging (the first version of the pipeline)")
     parser.add_argument("--refresh", action="store_true", help="re-read the raw tracking")
     parser.add_argument("--x-outside-play", action="store_true",
                         help="label halftime / outside-play frames X instead of leaving the "
@@ -211,7 +234,11 @@ if __name__ == "__main__":
     pitch = GAMES[GAME]["pitch"]
     bx, by, d_home, d_away = load_features(refresh=args.refresh)
 
-    e = emissions(bx, by, d_home, d_away, pitch)
+    sp = None if args.no_tagging else set_piece_mask(len(bx))
+    if sp is not None:
+        print("Smart Tagging set-piece frames: {} ({:.1f}%)".format(int(sp.sum()),
+                                                                100.0 * sp.mean()))
+    e = emissions(bx, by, d_home, d_away, pitch, sp)
     path = viterbi(e, log_transitions())
     path = merge_short_runs(path, MIN_RUN)
 
